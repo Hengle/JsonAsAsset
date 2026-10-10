@@ -125,13 +125,87 @@ namespace {
 
 		FUObjectExport* Export;
 	};
+
+	const UClass* GetClassToMake(FUObjectExport* Export) {
+#if ENGINE_UE5
+		/* UE5's CommonUI has no UCommonWidgetSwitcher of its own, so the export resolves to no class at all and
+		   the widget is never made. CommonUILegacy carries the original under its own name, and made as that one
+		   it still behaves the way the asset was authored against. */
+		if (Export->GetType() == TEXT("CommonWidgetSwitcher")) {
+			if (const UClass* LegacyClass = FindClassByType(TEXT("CommonWidgetSwitcherLegacy"))) {
+				return LegacyClass;
+			}
+		}
+#endif
+
+		return Export->GetClass();
+	}
+
+	FString GetObjectNameToMake(FUObjectExport* Export, const UClass* Class) {
+		FString ObjectName = Export->GetName().ToString();
+
+		if (Class->IsChildOf(UWidgetAnimation::StaticClass())) {
+			ObjectName.Split("_INST", &ObjectName, nullptr, ESearchCase::CaseSensitive);
+		}
+
+		return ObjectName;
+	}
+
+	/* Made in the outer its whole path names, and only there.
+	 *
+	 * Nothing is read into it here, and nothing is said when it cannot be made: the call further up
+	 * that is making it does both, and finding an object already there it only fills it in. */
+	void MakeAheadOfOuter(FUObjectExportContainer* Container, FUObjectExport* Export) {
+		const UClass* Class = GetClassToMake(Export);
+
+		if (Container == nullptr || Class == nullptr) return;
+		if (Class->IsChildOf(UClass::StaticClass()) || Class->HasAnyClassFlags(CLASS_Abstract)) return;
+
+		const TArray<FName> TreeSegments = Export->GetOuterTreeSegments(true);
+
+		if (TreeSegments.Num() == 0) return;
+
+		const FUObjectExport* OuterExport = Container->FindByTreeSegment(TreeSegments);
+		UObject* ObjectOuter = OuterExport->IsJsonValid() ? OuterExport->Object : nullptr;
+
+		if (ObjectOuter == nullptr) return;
+		if (Class->ClassWithin != nullptr && !ObjectOuter->IsA(Class->ClassWithin)) return;
+
+		const FName Named = StringToName(GetObjectNameToMake(Export, Class));
+
+		if (UObject* Standing = AlreadyThere(ObjectOuter, Named, Class)) {
+			Export->Object = Standing;
+
+			return;
+		}
+
+		EObjectFlags Flags = RF_Public | RF_Transactional;
+
+		if (Export->Has("Flags")) {
+			Flags = ParseObjectFlags(Export->GetString("Flags"));
+		}
+
+		Export->Object = NewObject<UObject>(ObjectOuter, ToNewObjectClass(Class), Named, Flags);
+	}
 }
 
 UObject* UObjectSerializer::SpawnExport(FUObjectExport* Export, const bool bOnlySerialize) {
 	if (Export == nullptr) return nullptr;
 
-	/* Already being made further up the stack, so what there is of it is all there is to give. */
-	if (GBeingMade.Contains(Export)) return Export->Object;
+	/* Already being made further up the stack, so what there is of it is all there is to give.
+	 *
+	 * Unless there is nothing of it yet because it is still looking for its outer, and the outer it
+	 * went to make is the one asking. A movie scene makes its sections before its tracks, a section
+	 * makes the track it lives in, and the track's own list of sections names the one that made it:
+	 * handed nothing, the track keeps nothing and the section is never part of it. The outer is
+	 * there by now, so the object is made in it here and left for the call that started it to fill. */
+	if (GBeingMade.Contains(Export)) {
+		if (Export->Object == nullptr) {
+			MakeAheadOfOuter(PropertySerializer->ExportsContainer, Export);
+		}
+
+		return Export->Object;
+	}
 
 	const FSpawnScope BeingMade(Export);
 
@@ -139,39 +213,25 @@ UObject* UObjectSerializer::SpawnExport(FUObjectExport* Export, const bool bOnly
 		if (Export->Object != nullptr) return nullptr;
 	}
 
-	const UClass* Class = Export->GetClass();
-
-#if ENGINE_UE5
-	/* UE5's CommonUI has no UCommonWidgetSwitcher of its own, so the export resolves to no class at all and
-	   the widget is never made. CommonUILegacy carries the original under its own name, and made as that one
-	   it still behaves the way the asset was authored against. */
-	if (Export->GetType() == TEXT("CommonWidgetSwitcher")) {
-		if (const UClass* LegacyClass = FindClassByType(TEXT("CommonWidgetSwitcherLegacy"))) {
-			Class = LegacyClass;
-		}
-	}
-#endif
+	const UClass* Class = GetClassToMake(Export);
 
 	if (!Class) return nullptr;
 
 	const FString Outer = GetOuterFromObjectOuter(Export->JsonObject->TryGetField(TEXT("Outer")));
 	UObject* ObjectOuter = nullptr;
 
-	/* Find the outer */
-	if (FUObjectExport* OuterExport = PropertySerializer->ExportsContainer->Find(Outer); !Outer.IsEmpty() && OuterExport->JsonObject.IsValid()) {
-		if (OuterExport->Object == nullptr) {
-			SpawnExport(OuterExport);
-		}
-		
-		ObjectOuter = OuterExport->Object;
-	}
+	/* Find the outer using the tree segment
+	 *
+	 * The whole way down first, and the names below only when it misses. A name is not one thing:
+	 * a widget's animations each keep a MovieScene2DTransformTrack_0, and asked by name the first
+	 * of them answers for all. Looking was never harmless either, since what it finds it makes.
+	 * One animation's section made another animation's track that way, which made that one's
+	 * movie scene and then the animation above it from underneath, and the animation asking
+	 * after its own movie scene, still part way made, was given nothing and kept nothing. */
+	const TArray<FName> TreeSegments = Export->GetOuterTreeSegments(true);
 
-	/* Find the blueprint outer */
-	if (!Outer.IsEmpty()) {
-		FString PotentialBPName;
-		Outer.Split("_C", &PotentialBPName, nullptr, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-		
-		if (FUObjectExport* OuterExport = PropertySerializer->ExportsContainer->Find(PotentialBPName); OuterExport->JsonObject.IsValid() && !IsEmpty(OuterExport->JsonObject->Values)) {
+	if (TreeSegments.Num() > 0) {
+		if (FUObjectExport* OuterExport = PropertySerializer->ExportsContainer->FindByTreeSegment(TreeSegments); OuterExport->IsJsonValid() && !IsEmpty(OuterExport->JsonObject->Values)) {
 			if (OuterExport->Object == nullptr) {
 				SpawnExport(OuterExport);
 			}
@@ -181,16 +241,30 @@ UObject* UObjectSerializer::SpawnExport(FUObjectExport* Export, const bool bOnly
 			}
 		}
 	}
-	
-	/* Find the outer using the tree segment */
-	const TArray<FName> TreeSegments = Export->GetOuterTreeSegments(true);
 
-	if (TreeSegments.Num() > 0) {
-		if (FUObjectExport* OuterExport = PropertySerializer->ExportsContainer->FindByTreeSegment(TreeSegments); OuterExport->IsJsonValid() && !IsEmpty(OuterExport->JsonObject->Values)) {
+	/* Find the outer */
+	const bool bWalkedToOuter = ObjectOuter != nullptr;
+
+	if (!bWalkedToOuter) {
+		if (FUObjectExport* OuterExport = PropertySerializer->ExportsContainer->Find(Outer); !Outer.IsEmpty() && OuterExport->JsonObject.IsValid()) {
 			if (OuterExport->Object == nullptr) {
 				SpawnExport(OuterExport);
 			}
-		
+
+			ObjectOuter = OuterExport->Object;
+		}
+	}
+
+	/* Find the blueprint outer */
+	if (!bWalkedToOuter && !Outer.IsEmpty()) {
+		FString PotentialBPName;
+		Outer.Split("_C", &PotentialBPName, nullptr, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+
+		if (FUObjectExport* OuterExport = PropertySerializer->ExportsContainer->Find(PotentialBPName); OuterExport->JsonObject.IsValid() && !IsEmpty(OuterExport->JsonObject->Values)) {
+			if (OuterExport->Object == nullptr) {
+				SpawnExport(OuterExport);
+			}
+
 			if (OuterExport->Object) {
 				ObjectOuter = OuterExport->Object;
 			}
@@ -208,12 +282,7 @@ UObject* UObjectSerializer::SpawnExport(FUObjectExport* Export, const bool bOnly
 	}
 
 	if (!Export->Object) {
-		FString ObjectName = Export->GetName().ToString();
-
-		if (Class->IsChildOf(UWidgetAnimation::StaticClass())) {
-			ObjectName.Split("_INST", &ObjectName, nullptr, ESearchCase::CaseSensitive);
-		}
-
+		const FString ObjectName = GetObjectNameToMake(Export, Class);
 		const FName Named = StringToName(ObjectName);
 
 		/* Only made where its kind is allowed to live.

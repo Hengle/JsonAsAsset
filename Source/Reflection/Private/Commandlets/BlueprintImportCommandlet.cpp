@@ -89,6 +89,27 @@ int32 UBlueprintImportCommandlet::Main(const FString& Params) {
 		return 1;
 	}
 
+	/* Only the one blueprint, with what it names left to whatever the project already has.
+	 *
+	 * A function library names every ability its functions check against, and fetched along with
+	 * it those come across as blueprints of their own, each with its own references, whether or
+	 * not anything here could compile them. */
+	if (FParse::Param(*Params, TEXT("norefs"))) {
+		FAssetUtilities::bImportReferences = false;
+
+		UE_LOG(LogBlueprintImport, Display, TEXT("not reflecting referenced assets"));
+	}
+
+	/* The class without what it does: its parent, its variables and what its default object holds.
+	 *
+	 * Enough for a blueprint that only reads another's defaults to compile against it, when the
+	 * graphs of that other one are a system of their own that is not being brought across. */
+	if (FParse::Param(*Params, TEXT("nocode"))) {
+		GetSettings()->AssetSettings.ImportBlueprintCode = false;
+
+		UE_LOG(LogBlueprintImport, Display, TEXT("leaving the graphs empty"));
+	}
+
 	/* The runtime carries the project name a cloud path is turned into an editor one with, and
 	 * nothing has fetched it in a run with no editor around it */
 	Cloud::EnsureMetadataBlocking();

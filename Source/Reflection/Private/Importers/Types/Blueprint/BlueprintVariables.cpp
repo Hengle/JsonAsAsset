@@ -12,6 +12,7 @@
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "UObject/CoreRedirects.h"
 
 namespace {
 	/* The referenced object of a property field, ex: the Struct of a StructProperty.
@@ -65,7 +66,29 @@ namespace {
 		}
 
 #if UE5_1_BEYOND
-		return FindFirstObject<T>(*Name.ToString());
+		if (T* Found = FindFirstObject<T>(*Name.ToString())) {
+			return Found;
+		}
+
+		/* Renamed since the build the export was made from.
+		 *
+		 * The engine keeps the old name only as a redirect in its config, MatineeCameraShake becoming
+		 * LegacyCameraShake, so asked for by the name the export carries the type is not there at
+		 * all and the variable is dropped. A package already saved with the old name loads through
+		 * the same redirect, so following it here gives the type the engine would have used. */
+		const ECoreRedirectFlags Kind = std::is_same_v<T, UEnum> ? ECoreRedirectFlags::Type_Enum
+			: (std::is_same_v<T, UScriptStruct> ? ECoreRedirectFlags::Type_Struct : ECoreRedirectFlags::Type_Class);
+		const FCoreRedirectObjectName Redirected = FCoreRedirects::GetRedirectedName(Kind, FCoreRedirectObjectName(Name, NAME_None, NAME_None));
+
+		if (Redirected.ObjectName == Name && Redirected.PackageName.IsNone()) {
+			return nullptr;
+		}
+
+		if (!Redirected.PackageName.IsNone()) {
+			return FindObject<T>(nullptr, *Redirected.ToString());
+		}
+
+		return FindFirstObject<T>(*Redirected.ObjectName.ToString());
 #else
 		return FindObject<T>(ANY_PACKAGE, *Name.ToString());
 #endif

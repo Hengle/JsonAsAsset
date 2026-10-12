@@ -339,8 +339,14 @@ TSharedPtr<FJsonObject> Cloud::Export::GetStaticMeshBlocking(const FString& Path
 	return Response;
 }
 
-bool Cloud::Export::GetBinaryBlocking(const FString& Path, const FString& ContentType, TArray<uint8>& OutData) {
-	const FReflectionHttpRequest Request = BuildRequest(ExportURL, { { TEXT("path"), Path } }, { { TEXT("content-type"), ContentType } });
+bool Cloud::Export::GetBinaryBlocking(const FString& Path, const FString& ContentType, TArray<uint8>& OutData, const FString& Named) {
+	TMap<FString, FString> Parameters = { { TEXT("path"), Path } };
+
+	if (!Named.IsEmpty()) {
+		Parameters.Add(TEXT("export_name"), Named);
+	}
+
+	const FReflectionHttpRequest Request = BuildRequest(ExportURL, Parameters, { { TEXT("content-type"), ContentType } });
 	Request->SetVerb(TEXT("GET"));
 
 	const FReflectionHttpResponse Response = FRemoteUtilities::ExecuteRequestBlocking(Request);

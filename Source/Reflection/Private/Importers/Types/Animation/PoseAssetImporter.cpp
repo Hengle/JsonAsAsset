@@ -20,7 +20,6 @@
 #include "Modules/Cloud/Remote.h"
 #include "Utilities/JsonHelpers.h"
 
-#if !UE5_3_BEYOND
 namespace {
 	/* One of the container's own lists, which it keeps to itself */
 	FScriptArrayHelper* ListIn(UPoseAsset* PoseAsset, const TCHAR* Called, TUniquePtr<FScriptArrayHelper>& Held) {
@@ -38,27 +37,71 @@ namespace {
 		return Held.Get();
 	}
 
-	/* The names a pose is found by, put where this engine keeps them. */
-	void NameThePoses(UPoseAsset* PoseAsset, USkeleton* Skeleton, const TSharedPtr<FJsonObject>& PoseContainer) {
-		if (PoseAsset == nullptr || Skeleton == nullptr || !PoseContainer.IsValid()) return;
+	/* A name out of the cook, which carried a display name of its own before 5.3 flattened them */
+	FString NameFrom(const TSharedPtr<FJsonValue>& Value) {
+		if (!Value.IsValid()) return FString();
 
-		const auto Registered = [Skeleton](const FString& Called) {
-			FSmartName Name;
+		if (Value->Type != EJson::Object) return Value->AsString();
 
+		FString Called;
+		Value->AsObject()->TryGetStringField(TEXT("DisplayName"), Called);
+
+		return Called;
+	}
+
+	/* What the cook calls the poses, under either of the two names the field has gone by */
+	const TArray<TSharedPtr<FJsonValue>>* PoseNamesIn(const TSharedPtr<FJsonObject>& PoseContainer) {
+		const TArray<TSharedPtr<FJsonValue>>* Named = nullptr;
+
+		if (PoseContainer->TryGetArrayField(TEXT("PoseFNames"), Named)) return Named;
+		if (PoseContainer->TryGetArrayField(TEXT("PoseNames"), Named)) return Named;
+
+		return nullptr;
+	}
+
+#if UE5_3_BEYOND
+	using FPoseNameType = FName;
+
+	/* Nothing to register a name against from 5.3 on, where a pose is found by the name itself */
+	FName Registered(USkeleton*, const FString& Called) {
+		return FName(*Called);
+	}
+#else
+	using FPoseNameType = FSmartName;
+
+	FSmartName Registered(USkeleton* Skeleton, const FString& Called) {
+		FSmartName Name;
+
+		if (Skeleton != nullptr) {
 			Skeleton->AddSmartNameAndModify(USkeleton::AnimCurveMappingName, FName(*Called), Name);
+		}
 
-			return Name;
-		};
+		return Name;
+	}
+#endif
+
+	/* The names a pose is found by, put where this engine keeps them */
+	void NameThePoses(UPoseAsset* PoseAsset, USkeleton* Skeleton, const TSharedPtr<FJsonObject>& PoseContainer) {
+		if (PoseAsset == nullptr || !PoseContainer.IsValid()) return;
+
+#if UE5_3_BEYOND
+		const TCHAR* NameList = TEXT("PoseFNames");
+#else
+		/* A name is an entry on the skeleton here, so there is nowhere to put one without it */
+		if (Skeleton == nullptr) return;
+
+		const TCHAR* NameList = TEXT("PoseNames");
+#endif
 
 		TUniquePtr<FScriptArrayHelper> Held;
 
 		/* What each pose is called */
-		if (const TArray<TSharedPtr<FJsonValue>>* Named = nullptr; PoseContainer->TryGetArrayField(TEXT("PoseFNames"), Named)) {
-			if (FScriptArrayHelper* Names = ListIn(PoseAsset, TEXT("PoseNames"), Held)) {
+		if (const TArray<TSharedPtr<FJsonValue>>* Named = PoseNamesIn(PoseContainer)) {
+			if (FScriptArrayHelper* Names = ListIn(PoseAsset, NameList, Held)) {
 				Names->Resize(Named->Num());
 
 				for (int32 Index = 0; Index < Named->Num(); ++Index) {
-					*reinterpret_cast<FSmartName*>(Names->GetRawPtr(Index)) = Registered((*Named)[Index]->AsString());
+					*reinterpret_cast<FPoseNameType*>(Names->GetRawPtr(Index)) = Registered(Skeleton, NameFrom((*Named)[Index]));
 				}
 			}
 		}
@@ -69,16 +112,25 @@ namespace {
 				Curves->Resize(Written->Num());
 
 				for (int32 Index = 0; Index < Written->Num(); ++Index) {
-					const TSharedPtr<FJsonObject> One = (*Written)[Index].IsValid() ? (*Written)[Index]->AsObject() : nullptr;
+					const TSharedPtr<FJsonObject> One = (*Written)[Index].IsValid() && (*Written)[Index]->Type == EJson::Object ? (*Written)[Index]->AsObject() : nullptr;
 
 					if (!One.IsValid()) continue;
 
 					FAnimCurveBase& Curve = *reinterpret_cast<FAnimCurveBase*>(Curves->GetRawPtr(Index));
 
+					/* Flat as CurveName since 5.3, and a Name with a display name inside it before that */
 					FString Called;
 
-					if (One->TryGetStringField(TEXT("CurveName"), Called)) {
-						Curve.Name = Registered(Called);
+					if (!One->TryGetStringField(TEXT("CurveName"), Called)) {
+						Called = NameFrom(One->Values.FindRef(TEXT("Name")));
+					}
+
+					if (!Called.IsEmpty()) {
+#if UE5_3_BEYOND
+						Curve.SetName(FName(*Called));
+#else
+						Curve.Name = Registered(Skeleton, Called);
+#endif
 					}
 
 					if (int32 Flags = 0; One->TryGetNumberField(TEXT("CurveTypeFlags"), Flags)) {
@@ -88,10 +140,11 @@ namespace {
 			}
 		}
 
+#if !UE5_3_BEYOND
 		Skeleton->Modify(true);
+#endif
 	}
 }
-#endif
 
 UObject* IPoseAssetImporter::CreateAsset(UObject* CreatedAsset) {
 	return IImporter::CreateAsset(NewObject<UPoseAsset>(GetPackage(), UPoseAsset::StaticClass(), *GetAssetName(), RF_Standalone | RF_Public));
@@ -113,9 +166,15 @@ bool IPoseAssetImporter::Import() {
 	/* Final operation to set properties */
 	GetObjectSerializer()->DeserializeObjectProperties(GetAssetData(), PoseAsset);
 
-#if !UE5_3_BEYOND
 	if (GetAssetData()->HasField(TEXT("PoseContainer"))) {
 		NameThePoses(PoseAsset, PoseAsset->GetSkeleton(), GetAssetData()->GetObjectField(TEXT("PoseContainer")));
+	}
+
+#if WITH_EDITOR
+	/* Track indices and the curve table are worked out rather than stored, and nothing has done that pass yet */
+	if (const int32 BasePose = PoseAsset->GetBasePoseIndex(); BasePose == INDEX_NONE || BasePose < PoseAsset->GetNumPoses()) {
+		/* Handed back what it already holds, since the pass itself is private and this is the way in to it */
+		PoseAsset->ConvertSpace(PoseAsset->IsValidAdditive(), BasePose);
 	}
 #endif
 

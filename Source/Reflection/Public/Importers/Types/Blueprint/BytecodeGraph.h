@@ -404,6 +404,9 @@ private:
 	/* The compiler's scratch the run tests to decide where to go, which is anything kept from one time to the next */
 	TSet<FString> TestedScratch;
 
+	/* The compiler's scratch that is never assigned, only handed by reference to whatever fills it: an array a Local node holds */
+	TSet<FString> HeldScratch;
+
 	/* The Local node each kept scratch was made as */
 	TMap<FString, TWeakObjectPtr<class UK2Node_TemporaryVariable>> Temporaries;
 

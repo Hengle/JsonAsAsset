@@ -1053,6 +1053,9 @@ int32 IBlueprintImporter::ConstructGraphs() {
 	TArray<TTuple<int32, TWeakObjectPtr<UK2Node>, FName>> Resumed;
 	TMap<FString, TArray<TSharedPtr<FJsonValue>>> Signatures;
 
+	/* What each event says about itself, which is where whether it runs on other machines is kept */
+	TMap<FString, FString> Said;
+
 	/* Which parameter each function is handed its world context through, where any is. The entry
 	 * node of a static function makes that pin itself, so declaring one as well leaves the function
 	 * taking it twice and the signature no longer matching what the script calls. */
@@ -1198,6 +1201,7 @@ int32 IBlueprintImporter::ConstructGraphs() {
 
 		if (Written.Kind == FBlueprintGraphs::EWritten::Event) {
 			Signatures.Add(Name, Declared);
+			Said.Add(Name, Function.GetString(TEXT("FunctionFlags")));
 			Events.Add(TPair<FString, FBlueprintGraphs::FWritten>(Name, Written));
 
 			continue;
@@ -1530,6 +1534,26 @@ int32 IBlueprintImporter::ConstructGraphs() {
 			bSignatures = bSignatures || Node != nullptr;
 
 			if (Node == nullptr) continue;
+
+			/* Sent where the asset said it was sent. An event somebody made is run where it was
+			 * called unless it was marked to go to the server, an owning client or everyone, and
+			 * read back without that mark it quietly stops reaching anywhere but here. */
+			if (UK2Node_CustomEvent* Custom = Cast<UK2Node_CustomEvent>(Node)) {
+				const FString& Flags = Said.FindRef(Event.Key);
+
+				const TPair<const TCHAR*, EFunctionFlags> Marks[] = {
+					{ TEXT("FUNC_NetMulticast"), FUNC_NetMulticast },
+					{ TEXT("FUNC_NetServer"), FUNC_NetServer },
+					{ TEXT("FUNC_NetClient"), FUNC_NetClient },
+					{ TEXT("FUNC_NetReliable"), FUNC_NetReliable },
+				};
+
+				for (const TPair<const TCHAR*, EFunctionFlags>& Mark : Marks) {
+					if (Flags.Contains(Mark.Key)) Custom->FunctionFlags |= Mark.Value;
+				}
+
+				if (Custom->FunctionFlags & FUNC_NetFuncFlags) Custom->FunctionFlags |= FUNC_Net;
+			}
 
 			Written.Add(Event.Key);
 

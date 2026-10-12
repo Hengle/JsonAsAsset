@@ -187,6 +187,13 @@ struct FAsyncTaskTidy final : FGraphTidy {
 				if (UK2Node_AddDelegate* Binding = Cast<UK2Node_AddDelegate>(Along)) {
 					Binds.Add(Binding);
 				} else if (UK2Node_CallFunction* Begin = Cast<UK2Node_CallFunction>(Along)) {
+					/* Only something the task does to itself begins it. The node calls it on the
+					 * task it made, and a call that is handed the task instead has nothing on it to
+					 * be called on, which the engine asserts on rather than reports. */
+					const UFunction* Starts = Begin->GetTargetFunction();
+
+					if (Starts == nullptr || Starts->HasAnyFunctionFlags(FUNC_Static) || !Task->IsChildOf(Starts->GetOwnerClass())) break;
+
 					Begins = Begin;
 				} else if (WaysOutOf(Along) < 2 || LeavesBy(Along) != nullptr) {
 					/* The look to see it was made, which is only this where nothing was drawn for
@@ -284,9 +291,12 @@ struct FAsyncTaskTidy final : FGraphTidy {
 			SayTo<FObjectProperty>(Waits, TEXT("ProxyFactoryClass"), Called->GetOwnerClass());
 			SayTo<FObjectProperty>(Waits, TEXT("ProxyClass"), Task);
 
-			if (Begins != nullptr && Begins->GetTargetFunction() != nullptr) {
-				SayTo<FNameProperty>(Waits, TEXT("ProxyActivateFunctionName"), Begins->GetTargetFunction()->GetFName());
-			}
+			/* Begun by whatever the script began it with, and by nothing where it began it with
+			 * nothing. Left alone, the node keeps the word to begin its own kind starts with, and
+			 * a task of another kind has nothing by that name to be called on. */
+			SayTo<FNameProperty>(Waits, TEXT("ProxyActivateFunctionName"), Begins != nullptr && Begins->GetTargetFunction() != nullptr
+				? Begins->GetTargetFunction()->GetFName()
+				: FName(NAME_None));
 
 			if (Waits->Pins.Num() == 0) Waits->AllocateDefaultPins();
 

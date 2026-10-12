@@ -40,6 +40,27 @@ inline void ReadPropertyReference(const FUObjectJsonValueExport& Property, FStri
 		}
 	}
 
+	/* Or as the property written out in full beside what holds it: the member is the inner one's
+	 * name, and the struct is its owner. A member of a struct a blueprint declared is said this way,
+	 * and read any other way it names nothing. */
+	if (const TSharedPtr<FJsonObject>* Inner = nullptr; Property.JsonObject->TryGetObjectField(TEXT("Property"), Inner)) {
+		if (Member.IsEmpty()) {
+			(*Inner)->TryGetStringField(TEXT("Name"), Member);
+		}
+
+		const TSharedPtr<FJsonObject>* Holder = nullptr;
+		FString Spelled;
+
+		if (Owner.IsEmpty() && Property.JsonObject->TryGetObjectField(TEXT("Owner"), Holder) && (*Holder)->TryGetStringField(TEXT("ObjectName"), Spelled)) {
+			/* UserDefinedStruct'SomeStruct' -> SomeStruct */
+			if (FString Held; Spelled.Split(TEXT("'"), nullptr, &Held)) {
+				Held.RemoveFromEnd(TEXT("'"));
+
+				Owner = Held;
+			}
+		}
+	}
+
 	if (!Owner.IsEmpty() && !Member.IsEmpty()) return;
 
 	FString Spelled;

@@ -362,7 +362,16 @@ UFunction* FBytecodeGraph::FindFunctionOn(const UClass* Class, const FString& Me
 	const FCoreRedirectObjectName Called(*Member, *Class->GetName(), NAME_None);
 	const FCoreRedirectObjectName Now = FCoreRedirects::GetRedirectedName(ECoreRedirectFlags::Type_Function, Called);
 
-	if (Now == Called) return nullptr;
+	if (Now == Called) {
+		/* Renamed with nothing left behind to say so. A function given a BP_ name for blueprints
+		 * keeps the name it had as what the editor shows, so a graph cooked before the rename still
+		 * reads the same, and that shown name is the one thing the two have in common. */
+		for (TFieldIterator<UFunction> It(Class, EFieldIteratorFlags::IncludeSuper, EFieldIteratorFlags::ExcludeDeprecated, EFieldIteratorFlags::IncludeInterfaces); It; ++It) {
+			if (It->GetMetaData(FBlueprintMetadata::MD_DisplayName).Replace(TEXT(" "), TEXT("")) == Member) return *It;
+		}
+
+		return nullptr;
+	}
 
 	/* A redirect may move it onto another class as well as rename it */
 	const UClass* On = Now.OuterName != Called.OuterName ? FindClassByType(Now.OuterName.ToString()) : Class;
@@ -1088,7 +1097,7 @@ bool FBytecodeGraph::KeepsTemporary(const FString& Name) const {
 	/* A macro that was read back holds its own */
 	if (Owned.Contains(Name)) return false;
 
-	return Running.Contains(Name) || TestedScratch.Contains(Name);
+	return Running.Contains(Name) || TestedScratch.Contains(Name) || HeldScratch.Contains(Name);
 }
 
 UEdGraphPin* FBytecodeGraph::Temporary(const FString& Name, const FUObjectJsonValueExport& Property) {
@@ -1285,6 +1294,19 @@ void FBytecodeGraph::BringInClass(const FUObjectJsonValueExport& Named) {
 	if (Leaf.IsEmpty()) return;
 
 	const FString Whole = Where + TEXT(".") + Leaf;
+
+	/* Already in the project but not loaded. Nothing has asked for it yet in a run that loads only
+	 * what it is pointed at, and one that is told to leave references alone never goes and gets it
+	 * either, so a class sitting on disk would read as one the build has not got. */
+	if (FPackageName::DoesPackageExist(Where)) {
+		LoadObject<UObject>(nullptr, *Whole);
+
+		if (FindClassByType(Kind) != nullptr) {
+			UE_LOG(LogReflectionBytecode, Display, TEXT("\"%s\" was already in the project, and was loaded"), *Whole);
+
+			return;
+		}
+	}
 
 	/* One at a time, and never the one already on its way.
 	 *
@@ -3317,12 +3339,10 @@ bool FBytecodeGraph::Place(const FUObjectJsonValueExport& Statement) {
 
 			Node->AllocateDefaultPins();
 
+			/* Given rather than connected, since what is written can be worked out below the write:
+			 * a cast the run jumps back up to is laid down after the member it fills */
 			if (UEdGraphPin* Pin = Node->FindPin(*Name, EGPD_Input)) {
-				if (Expression.Pin != nullptr) {
-					Connect(Expression.Pin, Pin);
-				} else if (!Expression.Literal.IsEmpty()) {
-					ApplyLiteral(Pin, Expression.Literal);
-				}
+				Give(Expression, Pin);
 			}
 
 			ChainExecution(Node);
@@ -3821,6 +3841,53 @@ namespace {
 
 		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Object->Values) NamesRead(Field.Value, Out);
 	}
+
+	/* The locals handed as the array to a call that changes it in place.
+	 *
+	 * Every array function takes its array by reference, but only these write to it. The rest only
+	 * read, and a value wired straight in serves them as well as a variable would. */
+	void ArraysChanged(const TSharedPtr<FJsonValue>& Held, TArray<FString>& Out) {
+		static const TSet<FString> Changing = {
+			TEXT("Array_Add"), TEXT("Array_AddUnique"), TEXT("Array_Append"), TEXT("Array_Insert"),
+			TEXT("Array_Remove"), TEXT("Array_RemoveItem"), TEXT("Array_Clear"), TEXT("Array_Resize"),
+			TEXT("Array_Shuffle"), TEXT("Array_Set"), TEXT("Array_Swap"),
+		};
+
+		if (!Held.IsValid()) return;
+
+		if (Held->Type == EJson::Array) {
+			for (const TSharedPtr<FJsonValue>& One : Held->AsArray()) ArraysChanged(One, Out);
+
+			return;
+		}
+
+		if (Held->Type != EJson::Object) return;
+
+		const TSharedPtr<FJsonObject> Object = Held->AsObject();
+
+		if (!Object.IsValid()) return;
+
+		const TSharedPtr<FJsonObject>* Function = nullptr;
+		FString Called;
+
+		if (Object->TryGetObjectField(TEXT("Function"), Function) && Function != nullptr && (*Function).IsValid()
+			&& (*Function)->TryGetStringField(TEXT("ObjectName"), Called) && Called.Contains(TEXT("KismetArrayLibrary:"))) {
+			FString Short = Called;
+			Short.Split(TEXT(":"), nullptr, &Short);
+			Short.RemoveFromEnd(TEXT("'"));
+
+			const TArray<TSharedPtr<FJsonValue>>* Parameters = nullptr;
+
+			if (Changing.Contains(Short) && Object->TryGetArrayField(TEXT("Parameters"), Parameters) && Parameters != nullptr && Parameters->Num() > 0) {
+				TArray<FString> First;
+				NamesRead((*Parameters)[0], First);
+
+				if (First.Num() == 1) Out.Add(First[0]);
+			}
+		}
+
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Object->Values) ArraysChanged(Field.Value, Out);
+	}
 }
 
 /* Which casts were pure.
@@ -3927,6 +3994,19 @@ void FBytecodeGraph::FindAnswers() {
 		const FString Local = MacroReading::NamedProperty(Held.GetObject(TEXT("Variable")));
 
 		if (Out.IsEmpty() || Local != Out + TEXT("_Local")) continue;
+
+		/* Unless somebody declared it. A local of the function's own is editable and the compiler's
+		 * answer never is, and a name compared without case is no way to tell a sim_space_rotation_local
+		 * somebody wrote apart from the one the compiler would have made. */
+		const FUObjectJsonValueExport Kept = Held.GetObject(TEXT("Variable"));
+		const FUObjectJsonValueExport Described = Kept.Has(TEXT("Property")) ? Kept.GetObject(TEXT("Property")) : Kept;
+
+		if (Described.Has(TEXT("PropertyFlags"))) {
+			TArray<FString> Flags;
+			Described.GetString(TEXT("PropertyFlags")).ParseIntoArray(Flags, TEXT(" | "));
+
+			if (Flags.Contains(TEXT("Edit"))) continue;
+		}
 
 		Answered.Add(Local, Out);
 	}
@@ -4091,6 +4171,38 @@ void FBytecodeGraph::FindConstants() {
 
 		if (const FString Asked = MacroReading::ReadFrom(Statement.GetObject(TEXT("BooleanExpression"))); Asked.StartsWith(TEXT("Temp_"))) {
 			TestedScratch.Add(Asked);
+		}
+	}
+
+	/* Scratch nothing ever assigns.
+	 *
+	 * A Local node holding an array is filled and emptied by the calls it is handed to, Add and
+	 * Clear taking it by reference, so no statement writes it. It is still one node the graph drew,
+	 * and every call that takes it has to be wired to that node, or a by-reference pin is left
+	 * empty and the blueprint does not compile. */
+	for (const FUObjectJsonValueExport& Statement : Statements) {
+		if (!Statement.JsonObject.IsValid()) continue;
+
+		TArray<FString> Reads;
+
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Statement.JsonObject->Values) NamesRead(Field.Value, Reads);
+
+		for (const FString& Read : Reads) {
+			if (Read.StartsWith(TEXT("Temp_")) && !Writes.Contains(Read)) HeldScratch.Add(Read);
+		}
+
+		/* Or assigned once and then changed in place.
+		 *
+		 * Copied out of a call, it reads like a copy that could be wired straight from the call, and
+		 * for Length and Get it could. Clear and Add change the array they are handed, and the only
+		 * thing that can be handed to a by-reference pin is a variable, so it has to stay the Local
+		 * node it was, assigned and then changed, or that pin is left empty. */
+		TArray<FString> Changed;
+
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Statement.JsonObject->Values) ArraysChanged(Field.Value, Changed);
+
+		for (const FString& One : Changed) {
+			if (One.StartsWith(TEXT("Temp_"))) HeldScratch.Add(One);
 		}
 	}
 
@@ -4839,6 +4951,67 @@ int32 FBytecodeGraph::Build() {
 		}
 	}
 
+	/* What the compiler wraps around writing a replicated member. A Set node on one is expanded into
+	 * a dormancy flush before the write and a push model mark after it, and both come back again
+	 * when the Set is compiled here, so read back as nodes each would run twice. The mark is only
+	 * ever the compiler's; a flush is someone's own unless it leads straight into such a write. */
+	for (int32 Index = 0; Index < Statements.Num(); ++Index) {
+		const FUObjectJsonValueExport& Statement = Statements[Index];
+		const FString Token = MacroReading::TokenOf(Statement);
+
+		const FString Called = Statement.Has(TEXT("Function")) && Statement.JsonObject->HasTypedField<EJson::Object>(TEXT("Function"))
+			? Statement.GetObject(TEXT("Function")).GetString(TEXT("ObjectName"))
+			: FString();
+
+		if (Token == TEXT("EX_CallMath") && Called.EndsWith(TEXT(":MarkPropertyDirtyFromRepIndex'"))) {
+			Ignored.Add(MacroReading::AddressOf(Statement));
+
+			continue;
+		}
+
+		if (Token != TEXT("EX_FinalFunction") || !Called.EndsWith(TEXT("Actor:FlushNetDormancy'"))) continue;
+
+		/* The flush goes in ahead of the Set, and what the Set is given is worked out after it, so
+		 * the write is the first thing past the flush that is not working a value out: a local being
+		 * filled, or a library call handing its answers back through locals */
+		for (int32 Ahead = Index + 1; Statements.IsValidIndex(Ahead); ++Ahead) {
+			const FUObjectJsonValueExport& Next = Statements[Ahead];
+			const FString Going = MacroReading::TokenOf(Next);
+
+			if (Going == TEXT("EX_CallMath")) continue;
+
+			if (!Going.StartsWith(TEXT("EX_Let")) || !Next.Has(TEXT("Variable"))) break;
+
+			const FUObjectJsonValueExport Target = Next.GetObject(TEXT("Variable"));
+			const FString Into = MacroReading::TokenOf(Target);
+
+			if (Into == TEXT("EX_LocalVariable")) continue;
+
+			if (Into == TEXT("EX_InstanceVariable") && Target.Has(TEXT("Variable"))) {
+				const FUObjectJsonValueExport Held = Target.GetObject(TEXT("Variable"));
+
+				/* Said with the property beside its owner, or as the property itself. Replicated is what
+				 * the compiler asks, which one spelling says by a rep index and the other only by its flags. */
+				const FUObjectJsonValueExport Assigned = Held.Has(TEXT("Property")) ? Held.GetObject(TEXT("Property")) : Held;
+
+				bool bReplicated = Assigned.Has(TEXT("RepIndex"));
+
+				if (!bReplicated && Assigned.Has(TEXT("PropertyFlags"))) {
+					TArray<FString> Flags;
+					Assigned.GetString(TEXT("PropertyFlags")).ParseIntoArray(Flags, TEXT(" | "));
+
+					bReplicated = Flags.Contains(TEXT("Net"));
+				}
+
+				if (bReplicated) {
+					Ignored.Add(MacroReading::AddressOf(Statement));
+				}
+			}
+
+			break;
+		}
+	}
+
 	/* Walked by number rather than one at a time, since a macro accounts for a run of them */
 	for (int32 Index = 0; Index < Statements.Num(); ++Index) {
 		const FUObjectJsonValueExport& Statement = Statements[Index];
@@ -5032,7 +5205,8 @@ int32 FBytecodeGraph::Build() {
 	if (bTidy) {
 		/* Any of them can be left out by name, since one or two trade a little of the script for how it reads */
 		FString Skipping;
-		FParse::Value(FCommandLine::Get(), TEXT("skiptidy="), Skipping);
+		/* Read past the commas, which a value is otherwise cut off at */
+		FParse::Value(FCommandLine::Get(), TEXT("skiptidy="), Skipping, false);
 
 		TArray<FString> LeftOut;
 		Skipping.ParseIntoArray(LeftOut, TEXT(","));

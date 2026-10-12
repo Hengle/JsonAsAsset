@@ -43,6 +43,39 @@
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #endif
 
+static void CloudButtonPressed() {
+	if (!Cloud::Status::IsOpened()) {
+		LaunchURL(GitHub::README::Cloud);
+	}
+}
+
+static FText GetCloudButtonLabel() {
+	return Cloud::Status::IsOpened() ? FText::FromString("On") : FText::FromString("Off");
+}
+
+static FText GetCloudButtonTooltip() {
+	return Cloud::Status::IsOpened()
+		? FText::FromString("Cloud is running.")
+		: FText::FromString("Cloud isn't running. Click to read how to set one up.");
+}
+
+/* The dropdown is only worth opening when there is something behind it */
+static bool CanOpenCloudMenu() {
+	return Cloud::Status::IsOpened();
+}
+
+#if ENGINE_UE5
+/* Reflection ships no validation artwork, so the editor's own stands in */
+static FSlateIcon GetValidationIcon() {
+	return FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Validate");
+}
+
+/* The same one the tools menu carried while it was a submenu */
+static FSlateIcon GetAssetToolsIcon() {
+	return FSlateIcon(FAppStyle::GetAppStyleSetName(), "DeveloperTools.MenuIcon");
+}
+#endif
+
 void UReflectionToolbar::Register() {
 #if ENGINE_UE5
 	/* false: uses top toolbar. true: uses content browser toolbar */

@@ -1541,12 +1541,23 @@ int32 IBlueprintImporter::ConstructGraphs() {
 			if (UK2Node_CustomEvent* Custom = Cast<UK2Node_CustomEvent>(Node)) {
 				const FString& Flags = Said.FindRef(Event.Key);
 
+#if UE4_26
+				const TTuple<const TCHAR*, EFunctionFlags> Marks[] = {
+					TTuple<const TCHAR*, EFunctionFlags>(TEXT("FUNC_NetMulticast"), FUNC_NetMulticast),
+					TTuple<const TCHAR*, EFunctionFlags>(TEXT("FUNC_NetServer"), FUNC_NetServer),
+					TTuple<const TCHAR*, EFunctionFlags>(TEXT("FUNC_NetClient"), FUNC_NetClient),
+					TTuple<const TCHAR*, EFunctionFlags>(TEXT("FUNC_NetReliable"), FUNC_NetReliable),
+				};
+#else
+				
 				const TPair<const TCHAR*, EFunctionFlags> Marks[] = {
 					{ TEXT("FUNC_NetMulticast"), FUNC_NetMulticast },
 					{ TEXT("FUNC_NetServer"), FUNC_NetServer },
 					{ TEXT("FUNC_NetClient"), FUNC_NetClient },
 					{ TEXT("FUNC_NetReliable"), FUNC_NetReliable },
 				};
+				
+#endif // UE4_26
 
 				for (const TPair<const TCHAR*, EFunctionFlags>& Mark : Marks) {
 					if (Flags.Contains(Mark.Key)) Custom->FunctionFlags |= Mark.Value;

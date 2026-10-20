@@ -100,14 +100,7 @@ public:
 
 	/* On, the reflect button opens a file dialog and imports a json you exported yourself. Off, it
 	 * asks for an asset path and pulls the data from Cloud. */
-	UPROPERTY(
-		#if !REFLECTION_CLOUD_SERVER
-			EditAnywhere,
-			DisplayName = "Use Local Json instead of Cloud",
-			Category = Settings,
-			Config
-		#endif
-	)
+	UPROPERTY(EditAnywhere, DisplayName = "Use Local Json instead of Cloud", Category = Settings, Config)
 	bool UseLocalJson = false;
 
 	/* Enables experimental/developing features. Features may not work as intended. */
